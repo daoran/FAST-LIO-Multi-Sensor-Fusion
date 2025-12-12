@@ -1,10 +1,12 @@
 common:
     lid_topic:  "/ouster/points"
-    imu_topic:  "/ouster/imu"
+    imu_topic:  "/imu_result"
     wheel_topic: "/odom"
+    gnss_topic:  "/ublox_driver/receiver_lla"
     use_wheel: false
+    use_gnss: true
     time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
-    time_offset_lidar_to_imu: -0.014057 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
+    time_offset_lidar_to_imu: 0.017784 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
                                   # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
     
 preprocess:
@@ -30,16 +32,19 @@ mapping:
     fov_degree:    180
     det_range:     150.0
     extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic
-    extrinsic_T: [ 0.063169, -0.014907, -0.316769 ]
-    extrinsic_R: [0.999017,  0.036432,  0.025237,
-                  -0.036084,  0.999249, -0.014119,
-                  -0.025733,  0.013194,  0.999582]
+    extrinsic_T: [ 0.073, 0.0, 0.54847 ]
+    extrinsic_R: [    0.999955,  0.00101452,   0.0094408,
+                      -0.00109978,    0.999959,  0.00903018,
+                      -0.00943125, -0.00904016,    0.999915]
+
+    extrinT_Gnss2IMU: [ 0.3, 0.0, 0.1 ]
+    extrinsic_leverarm_en: false
 
 publish:
     path_en:  true
     scan_publish_en:  true       # false: close all the point cloud output
     dense_publish_en: false       # false: low down the points number in a global-frame point clouds scan.
-    scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
+    scan_bodyframe_pub_en: false  # true: output the point cloud scans in IMU-body-frame
 
 pcd_save:
     pcd_save_en: true

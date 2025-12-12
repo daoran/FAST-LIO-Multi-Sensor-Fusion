@@ -3,7 +3,7 @@ common:
     lid_topic_right:  "/ns1/velodyne_points"
     imu_topic:  "/imu/data_raw"
     wheel_topic: "/odom"
-    gnss_topic:  "/gps/fix"
+    gnss_topic:  "/vrs_gps_data"
     use_wheel: true
     use_gnss: true
     time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
@@ -50,9 +50,7 @@ mapping:
                          0,         0,         0,         1 ]
 
     extrinT_Gnss2IMU: [ -0.25, 0, 0.0 ]
-    extrinR_Gnss2IMU: [ 1, 0, 0,
-                          0, 1, 0,
-                          0, 0, 1 ]
+    extrinsic_leverarm_en: false
 
 publish:
     path_en:  true

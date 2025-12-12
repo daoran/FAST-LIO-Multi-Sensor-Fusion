@@ -65,7 +65,7 @@
 #include "sensor_msgs/NavSatFix.h"
 
 #define INIT_TIME           (0.1)
-#define LASER_POINT_COV     (50)
+#define LASER_POINT_COV     (0.001)
 #define MAXN                (720000)
 #define PUBFRAME_PERIOD     (20)
 
@@ -167,9 +167,8 @@ geometry_msgs::Vector3 msg_gnss_cov;
 string gnss_topic ;
 ros::Publisher pubGnssCov;
 
-M3D Gnss_R_wrt_IMU(Eye3d) ;         // gnss  与 imu 的外参
+bool extrinsic_leverarm_en;
 V3D Gnss_T_wrt_IMU(Zero3d);
-M3D GNSS_Heading(Eye3d);
 bool gnss_inited = false ;                        //  是否完成gnss初始化
 shared_ptr<GnssProcess> p_gnss(new GnssProcess());
 GnssProcess gnss_data;
@@ -181,24 +180,19 @@ vector<double>       extrinR_Gnss2IMU(9, 0.0);
 using PointXYZIRT = velodyne_ros::Point;
 
 // fuse two lidar data for kaist dataset
-pcl::PointCloud<PointXYZIRT>::Ptr pointCloudLeftIn;
-pcl::PointCloud<PointXYZIRT>::Ptr pointCloudRightIn;
-pcl::PointCloud<PointXYZIRT>::Ptr pointCloudLeft;
-pcl::PointCloud<PointXYZIRT>::Ptr pointCloudRight;
-pcl::PointCloud<PointXYZIRT>::Ptr laserCloudIn;
+PointCloudXYZI::Ptr pointCloudLeftIn;
+PointCloudXYZI::Ptr pointCloudRightIn;
+PointCloudXYZI::Ptr pointCloudLeft;
+PointCloudXYZI::Ptr pointCloudRight;
+PointCloudXYZI::Ptr laserCloudIn;
 double leftTime = -1;
 double rightTime = -1;
 double middleTime = -1;
 
-deque<sensor_msgs::PointCloud2> cachePointCloudLeftQueue;
-deque<sensor_msgs::PointCloud2> cachePointCloudRightQueue;
-deque<pcl::PointCloud<PointXYZIRT>::Ptr> pointCloudLeftQueue;
-deque<pcl::PointCloud<PointXYZIRT>::Ptr> pointCloudRightQueue;
+deque<PointCloudXYZI::Ptr> pointCloudLeftQueue;
+deque<PointCloudXYZI::Ptr> pointCloudRightQueue;
 deque<double> timeLeftQueue;
 deque<double> timeRightQueue;
-
-sensor_msgs::PointCloud2 currentPointCloudLeftMsg;
-sensor_msgs::PointCloud2 currentPointCloudRightMsg;
 
 double left_pc_time = -1;
 double right_pc_time = -1;
@@ -339,9 +333,9 @@ void lasermap_fov_segment()
     kdtree_delete_time = omp_get_wtime() - delete_begin;
 }
 
-pcl::PointCloud<PointXYZIRT>::Ptr transformPointCloud_kaist(pcl::PointCloud<PointXYZIRT>::Ptr cloudIn, Eigen::Matrix4d &transform) {
+PointCloudXYZI::Ptr transformPointCloud_kaist(PointCloudXYZI::Ptr cloudIn, Eigen::Matrix4d &transform) {
 
-    pcl::PointCloud<PointXYZIRT>::Ptr cloudOut(new pcl::PointCloud<PointXYZIRT>());
+    PointCloudXYZI::Ptr cloudOut(new PointCloudXYZI());
 
     int cloudSize = cloudIn->size();
     cloudOut->resize(cloudSize);
@@ -354,56 +348,112 @@ pcl::PointCloud<PointXYZIRT>::Ptr transformPointCloud_kaist(pcl::PointCloud<Poin
         cloudOut->points[i].y = transform(1,0) * pointFrom.x + transform(1,1) * pointFrom.y + transform(1,2) * pointFrom.z + transform(1,3);
         cloudOut->points[i].z = transform(2,0) * pointFrom.x + transform(2,1) * pointFrom.y + transform(2,2) * pointFrom.z + transform(2,3);
         cloudOut->points[i].intensity = pointFrom.intensity;
-        cloudOut->points[i].ring = pointFrom.ring;
+        cloudOut->points[i].curvature = pointFrom.curvature;
+//        cloudOut->points[i].ring = pointFrom.ring;
         // cloudOut->points[i].time = pointFrom.time;
     }
     return cloudOut;
 }
 
-bool mergePointCloud()
-{
-    std::lock_guard<std::mutex> lock1(veloLock);
-
-    if(pointCloudLeftQueue.size() > 0 && pointCloudRightQueue.size() > 0 )
-    {
-//        cout << pointCloudLeftQueue.size() << " " << pointCloudRightQueue.size() << endl;
-        pointCloudLeft = std::move(pointCloudLeftQueue.front());
-        pointCloudLeftQueue.pop_front();
-        leftTime = std::move(timeLeftQueue.front());
-        timeLeftQueue.pop_front();
-        pointCloudRight = std::move(pointCloudRightQueue.front());
-        pointCloudRightQueue.pop_front();
-        rightTime = std::move(timeRightQueue.front());
-        timeRightQueue.pop_front();
-        middleTime = (leftTime + rightTime) / 2;
-//        cout << "left time " << to_string_with_precision(leftTime) << "right time " << to_string_with_precision(rightTime) << endl;
-        *laserCloudIn = *pointCloudLeft + *pointCloudRight;
-    }
-    else
-    {
-        ROS_WARN("Waiting for point cloud data ...");
+bool mergePointCloud() {
+    if (pointCloudLeftQueue.empty() || pointCloudRightQueue.empty()) {
         return false;
     }
+
+    auto left_cloud = pointCloudLeftQueue.front();
+    auto right_cloud = pointCloudRightQueue.front();
+    double t_left = timeLeftQueue.front();
+    double t_right = timeRightQueue.front();
+
+    // === 选择最早时间戳作为参考 ===
+    double ref_time = std::min(t_left, t_right);
+    bool left_is_earlier = (t_left <= t_right);
+
+    // 计算时间偏移（毫秒）
+    double left_offset = (t_left - ref_time) * 1000.0;   // 如果左雷达较早，offset=0
+    double right_offset = (t_right - ref_time) * 1000.0; // 如果右雷达较早，offset=0
+
+    // === 合并点云并调整时间戳 ===
+    laserCloudIn->clear();
+    laserCloudIn->points.reserve(left_cloud->size() + right_cloud->size());
+
+    // 先处理较早雷达的点（时间偏移较小/为0）
+    if (left_is_earlier) {
+        // 处理左雷达点云
+        for (auto& point : left_cloud->points) {
+            PointType new_point;
+            new_point.x = point.x;
+            new_point.y = point.y;
+            new_point.z = point.z;
+            new_point.intensity = point.intensity;
+            // 左雷达较早，时间偏移可能为0或很小
+            new_point.curvature = point.curvature + left_offset;
+            laserCloudIn->points.push_back(new_point);
+        }
+
+        // 处理右雷达点云
+        for (auto& point : right_cloud->points) {
+            PointType new_point;
+            new_point.x = point.x;
+            new_point.y = point.y;
+            new_point.z = point.z;
+            new_point.intensity = point.intensity;
+            new_point.curvature = point.curvature + right_offset;
+            laserCloudIn->points.push_back(new_point);
+        }
+    } else {
+        // 右雷达较早，先处理右雷达
+        for (auto& point : right_cloud->points) {
+            PointType new_point;
+            new_point.x = point.x;
+            new_point.y = point.y;
+            new_point.z = point.z;
+            new_point.intensity = point.intensity;
+            new_point.curvature = point.curvature + right_offset;
+            laserCloudIn->points.push_back(new_point);
+        }
+
+        // 处理左雷达点云
+        for (auto& point : left_cloud->points) {
+            PointType new_point;
+            new_point.x = point.x;
+            new_point.y = point.y;
+            new_point.z = point.z;
+            new_point.intensity = point.intensity;
+            new_point.curvature = point.curvature + left_offset;
+            laserCloudIn->points.push_back(new_point);
+        }
+    }
+
+    // === 按时间戳排序（重要！）===
+    std::sort(laserCloudIn->points.begin(), laserCloudIn->points.end(),
+              [](const PointType& a, const PointType& b) {
+                  return a.curvature < b.curvature;
+              });
+
+    laserCloudIn->width = laserCloudIn->points.size();
+    laserCloudIn->height = 1;
+    laserCloudIn->is_dense = true;
+
+    // 保存参考时间
+    middleTime = ref_time;
+    pointCloudLeftQueue.pop_front();
+    timeLeftQueue.pop_front();
+    pointCloudRightQueue.pop_front();
+    timeRightQueue.pop_front();
+
     return true;
 }
+
 
 void pointCloudLeftHandler(const sensor_msgs::PointCloud2ConstPtr& leftPointCloud)
 {
     left_pc_time = leftPointCloud->header.stamp.toSec();
 //    cout << "left_pc_time " << to_string_with_precision(left_pc_time) << endl;
 
-    currentPointCloudLeftMsg = *leftPointCloud;
+    p_pre->process(leftPointCloud, pointCloudLeftIn);
 
-    pcl::moveFromROSMsg(currentPointCloudLeftMsg, *pointCloudLeftIn);
-
-    if (pointCloudLeftIn->is_dense == false)
-    {
-        ROS_ERROR("Point cloud is not in dense format, please remove NaN points first!");
-        ros::shutdown();
-    }
-
-
-    pcl::PointCloud<PointXYZIRT>::Ptr pointCloudOut(new pcl::PointCloud<PointXYZIRT>());
+    PointCloudXYZI::Ptr pointCloudOut(new PointCloudXYZI());
     pointCloudOut = transformPointCloud_kaist(pointCloudLeftIn, leftLidarToImu);
 
     if (!pointCloudLeftQueue.empty())
@@ -413,30 +463,24 @@ void pointCloudLeftHandler(const sensor_msgs::PointCloud2ConstPtr& leftPointClou
         timeLeftQueue.pop_front();
     }
     pointCloudLeftQueue.push_back(pointCloudOut);
-    timeLeftQueue.push_back(currentPointCloudLeftMsg.header.stamp.toSec());
+    timeLeftQueue.push_back(leftPointCloud->header.stamp.toSec());
 
     if (!mergePointCloud()){
         return;
     }
-    sensor_msgs::PointCloud2 msgin;
-    pcl::toROSMsg(*laserCloudIn, msgin);
-    msgin.header.stamp = ros::Time().fromSec(rightTime);
-    sensor_msgs::PointCloud2::Ptr msg(new sensor_msgs::PointCloud2(msgin));
 
     mtx_buffer.lock();
     scan_count++;
     double preprocess_start_time = omp_get_wtime();
-    if (msg->header.stamp.toSec() < last_timestamp_lidar)
+    if (middleTime < last_timestamp_lidar)
     {
         ROS_ERROR("lidar loop back, clear buffer");
         lidar_buffer.clear();
     }
 
-    PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
-    p_pre->process(msg, ptr);
-    lidar_buffer.push_back(ptr);
-    time_buffer.push_back(msg->header.stamp.toSec());
-    last_timestamp_lidar = msg->header.stamp.toSec();
+    lidar_buffer.push_back(laserCloudIn);
+    time_buffer.push_back(middleTime);
+    last_timestamp_lidar = middleTime;
     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
@@ -448,18 +492,9 @@ void pointCloudRightHandler(const sensor_msgs::PointCloud2ConstPtr& rightPointCl
 
     right_pc_time = rightPointCloud->header.stamp.toSec();
 //    cout << "right_pc_time " << to_string_with_precision(right_pc_time) << endl;
+    p_pre->process(rightPointCloud, pointCloudRightIn);
 
-    currentPointCloudRightMsg = *rightPointCloud;
-
-    pcl::moveFromROSMsg(currentPointCloudRightMsg, *pointCloudRightIn);
-
-    if(pointCloudRightIn->is_dense == false)
-    {
-        ROS_ERROR("Point cloud is not in dense format, please remove NaN points first!");
-        ros::shutdown();
-    }
-
-    pcl::PointCloud<PointXYZIRT>::Ptr pointCloudOut(new pcl::PointCloud<PointXYZIRT>());
+    PointCloudXYZI::Ptr pointCloudOut(new PointCloudXYZI());
     pointCloudOut = transformPointCloud_kaist(pointCloudRightIn, rightLidarToImu);
 
     if (!pointCloudRightQueue.empty()){
@@ -468,7 +503,7 @@ void pointCloudRightHandler(const sensor_msgs::PointCloud2ConstPtr& rightPointCl
         timeRightQueue.pop_front();
     }
     pointCloudRightQueue.push_back(pointCloudOut);
-    timeRightQueue.push_back(currentPointCloudRightMsg.header.stamp.toSec());
+    timeRightQueue.push_back(rightPointCloud->header.stamp.toSec());
 
     return;
 
@@ -610,6 +645,9 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
 
     if(!gnss_inited){           //  初始化位置
         gnss_data.InitOriginPosition(msg_in->latitude, msg_in->longitude, msg_in->altitude) ;
+        state_ikfom init_state = kf.get_x(); // 初始状态量
+        init_state.offset_T_G_I = Gnss_T_wrt_IMU;
+        kf.change_x(init_state);
         gnss_inited = true ;
     }else{                               //   初始化完成
         gnss_data.UpdateXYZ(msg_in->latitude, msg_in->longitude, msg_in->altitude) ;             //  WGS84 -> ENU
@@ -618,10 +656,6 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
         gnss_pose(0,3) = gnss_data.local_E ;                 //    东
         gnss_pose(1,3) = gnss_data.local_N ;                 //     北
         gnss_pose(2,3) = gnss_data.local_U ;                 //    天
-
-        Eigen::Isometry3d trans(Gnss_R_wrt_IMU) ;
-        trans.pretranslate(Gnss_T_wrt_IMU);
-        gnss_pose  =  trans.inverse()  *  gnss_pose;  // convert gnss_pose to IMU frame
 
         nav_msgs::Odometry::Ptr gnss_data_enu(new nav_msgs::Odometry());
         // add new message to buffer:
@@ -635,6 +669,10 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
         gnss_data_enu->pose.pose.orientation.z =  geoQuat.z;
         gnss_data_enu->pose.pose.orientation.w =  geoQuat.w;
 
+        if (gnss_data.pose_cov[0] == 0 && gnss_data.pose_cov[1] == 0 && gnss_data.pose_cov[2] == 0){
+            ROS_ERROR("Gnss cov invalid");
+            return;
+        }
         gnss_data_enu->pose.covariance[0] = gnss_data.pose_cov[0] ;
         gnss_data_enu->pose.covariance[7] = gnss_data.pose_cov[1] ;
         gnss_data_enu->pose.covariance[14] = gnss_data.pose_cov[2] ;
@@ -646,7 +684,6 @@ void gnss_cbk(const sensor_msgs::NavSatFixConstPtr& msg_in)
         msg_gnss_pose.header.stamp = ros::Time().fromSec(gnss_data.time);
 
         Eigen::Vector3d gnss_vec(gnss_pose(0,3), gnss_pose(1,3), gnss_pose(2,3));
-        gnss_vec = GNSS_Heading * gnss_vec;
 
         msg_gnss_pose.pose.position.x = gnss_vec.x() ;
         msg_gnss_pose.pose.position.y = gnss_vec.y() ;
@@ -685,20 +722,23 @@ bool sync_packages(MeasureGroup &meas)
     {
         meas.lidar = lidar_buffer.front();
         meas.lidar_beg_time = time_buffer.front();
+        double end_time = meas.lidar->points.back().curvature;
+        if (isnan(end_time))
+            end_time = 0.0;
         if (meas.lidar->points.size() <= 1) // time too little
         {
             lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
             ROS_WARN("Too few input point cloud!\n");
         }
-        else if (meas.lidar->points.back().curvature / double(1000) < 0.5 * lidar_mean_scantime)
+        else if (end_time / double(1000) < 0.5 * lidar_mean_scantime)
         {
             lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
         }
         else
         {
             scan_num ++;
-            lidar_end_time = meas.lidar_beg_time + meas.lidar->points.back().curvature / double(1000);
-            lidar_mean_scantime += (meas.lidar->points.back().curvature / double(1000) - lidar_mean_scantime) / scan_num;
+            lidar_end_time = meas.lidar_beg_time + end_time / double(1000);
+            lidar_mean_scantime += (end_time / double(1000) - lidar_mean_scantime) / scan_num;
         }
 
         meas.lidar_end_time = lidar_end_time;
@@ -880,7 +920,8 @@ void publish_frame_body(const ros::Publisher & pubLaserCloudFull_body)
     pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
     laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudmsg.header.frame_id = "body";
-    pubLaserCloudFull_body.publish(laserCloudmsg);
+    if (pubLaserCloudFull_body.getNumSubscribers() != 0)
+        pubLaserCloudFull_body.publish(laserCloudmsg);
     publish_count -= PUBFRAME_PERIOD;
 }
 
@@ -897,7 +938,8 @@ void publish_effect_world(const ros::Publisher & pubLaserCloudEffect)
     pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
     laserCloudFullRes3.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudFullRes3.header.frame_id = "camera_init";
-    pubLaserCloudEffect.publish(laserCloudFullRes3);
+    if (pubLaserCloudEffect.getNumSubscribers() != 0)
+        pubLaserCloudEffect.publish(laserCloudFullRes3);
 }
 
 void publish_map(const ros::Publisher & pubLaserCloudMap)
@@ -906,6 +948,7 @@ void publish_map(const ros::Publisher & pubLaserCloudMap)
     pcl::toROSMsg(*featsFromMap, laserCloudMap);
     laserCloudMap.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudMap.header.frame_id = "camera_init";
+    if (pubLaserCloudMap.getNumSubscribers() != 0)
     pubLaserCloudMap.publish(laserCloudMap);
 }
 
@@ -928,7 +971,8 @@ void publish_odometry(const ros::Publisher &pubOdomAftMapped)
     odomAftMapped.child_frame_id = "body";
     odomAftMapped.header.stamp = ros::Time().fromSec(lidar_end_time);// ros::Time().fromSec(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped.publish(odomAftMapped);
+    if (pubOdomAftMapped.getNumSubscribers() != 0)
+        pubOdomAftMapped.publish(odomAftMapped);
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
     {
@@ -981,7 +1025,8 @@ void publish_gnss_path(const ros::Publisher pubPath)
     jjj++;
     if (jjj % 10 == 0)
     {
-        pubPath.publish(gps_path);
+        if (pubPath.getNumSubscribers() != 0)
+            pubPath.publish(gps_path);
     }
 }
 
@@ -995,25 +1040,21 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         ekfom_data.h_v = MatrixXd::Identity(3, 3);
         // residual (estimate heading)
         V3D gnss_pos(Measures.gnss.front()->pose.pose.position.x, Measures.gnss.front()->pose.pose.position.y, Measures.gnss.front()->pose.pose.position.z);
-        V3D res = s.offset_R_G_I * gnss_pos - s.pos;
+        M3D angv_crossmat;
+        angv_crossmat << SKEW_SYM_MATRX(s.offset_T_G_I);
+        V3D res = gnss_pos - s.rot.toRotationMatrix() * s.offset_T_G_I - s.pos;
         ekfom_data.h(0) = res.x();
         ekfom_data.h(1) = res.y();
         ekfom_data.h(2) = res.z();
         // jacobian (estimate heading)
         ekfom_data.h_x.block<3, 3>(0, 0) = -Eigen::Matrix3d::Identity(); // d_dp
-        M3D crossmat;
-        crossmat << SKEW_SYM_MATRX(gnss_pos);
-        auto P = kf.get_P();
-        cout << "roll std " << sqrt(P(30,30)) << " pitch std" << sqrt(P(31, 31)) << " yaw std " << sqrt(P(32, 32)) << endl;
-        // if yaw std converges do not estimate R_G_I
-        if (sqrt(P(32, 32)) > 1e-4)
-        {
-            ekfom_data.h_x.block<3, 3>(0, 30) = -(s.offset_R_G_I * crossmat); // d_dR_G_I
-            ROS_WARN("Estimate R_G_I !");
+        ekfom_data.h_x.block<3, 3>(3, 3) = s.rot.toRotationMatrix() * angv_crossmat; // d_dq
+        if (extrinsic_leverarm_en){
+            ekfom_data.h_x.block<3, 3>(0, 30) = -s.rot.toRotationMatrix(); // d_dTGI
         }
         // covariance
-        ekfom_data.R(0, 0) = 0.01 * Measures.gnss.front()->pose.covariance[0];
-        ekfom_data.R(1, 1) = 0.01 * Measures.gnss.front()->pose.covariance[7];
+        ekfom_data.R(0, 0) = Measures.gnss.front()->pose.covariance[0];
+        ekfom_data.R(1, 1) = Measures.gnss.front()->pose.covariance[7];
         ekfom_data.R(2, 2) = Measures.gnss.front()->pose.covariance[14];
         return;
     }
@@ -1192,11 +1233,11 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 int main(int argc, char** argv)
 {
     // allocateMemory();
-    pointCloudLeftIn.reset(new pcl::PointCloud<PointXYZIRT>());
-    pointCloudRightIn.reset(new pcl::PointCloud<PointXYZIRT>());
-    pointCloudLeft.reset(new pcl::PointCloud<PointXYZIRT>());
-    pointCloudRight.reset(new pcl::PointCloud<PointXYZIRT>());
-    laserCloudIn.reset(new pcl::PointCloud<PointXYZIRT>());
+    pointCloudLeftIn.reset((new PointCloudXYZI()));
+    pointCloudRightIn.reset((new PointCloudXYZI()));
+    pointCloudLeft.reset((new PointCloudXYZI()));
+    pointCloudRight.reset((new PointCloudXYZI()));
+    laserCloudIn.reset((new PointCloudXYZI()));
 
     pointCloudLeftIn->clear();
     pointCloudRightIn->clear();
@@ -1268,7 +1309,7 @@ int main(int argc, char** argv)
     nh.param<string>("common/gnss_topic", gnss_topic,"/gps/fix");
     nh.param<bool>("common/use_gnss", USE_GNSS, false);
     cout << "use_gnss " << int(USE_GNSS) << endl;
-    nh.param<vector<double>>("mapping/extrinR_Gnss2IMU", extrinR_Gnss2IMU, vector<double>());
+    nh.param<bool>("mapping/extrinsic_leverarm_en", extrinsic_leverarm_en, false);
     nh.param<vector<double>>("mapping/extrinT_Gnss2IMU", extrinT_Gnss2IMU, vector<double>());
     
     path.header.stamp    = ros::Time::now();
@@ -1309,7 +1350,6 @@ int main(int argc, char** argv)
 
     //设置gnss外参数
     Gnss_T_wrt_IMU<<VEC_FROM_ARRAY(extrinT_Gnss2IMU);
-    Gnss_R_wrt_IMU<<MAT_FROM_ARRAY(extrinR_Gnss2IMU);
 
     double epsi[33] = {0.001};
     fill(epsi, epsi + 33, 0.001);
@@ -1419,6 +1459,25 @@ int main(int argc, char** argv)
                 }
                 continue;
             }
+            else
+            {
+                if (rebuild_ikdtree_flag)
+                {
+                    if (feats_down_size > 5)
+                    {
+                        ikdtree.set_downsample_param(filter_size_map_min);
+                        feats_down_world->resize(feats_down_size);
+                        for (int i = 0; i < feats_down_size; i++)
+                        {
+                            pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+                        }
+                        ikdtree.Build(feats_down_world->points);
+                    }
+                    rebuild_ikdtree_flag = false;
+                    ROS_ERROR("Rebuild ikdtree!");
+                    continue;
+                }
+            }
             int featsFromMapNum = ikdtree.validnum();
             kdtree_size_st = ikdtree.size();
             
@@ -1480,7 +1539,8 @@ int main(int argc, char** argv)
             if (scan_pub_en || pcd_save_en)      publish_frame_world(pubLaserCloudFull);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body);
             // publish_effect_world(pubLaserCloudEffect);
-             publish_map(pubLaserCloudMap);
+            if (0)
+                publish_map(pubLaserCloudMap);
 
             /*** Debug variables ***/
             if (runtime_pos_log)
@@ -1505,7 +1565,7 @@ int main(int argc, char** argv)
                 s_plot9[time_log_counter] = aver_time_consu;
                 s_plot10[time_log_counter] = add_point_size;
                 time_log_counter ++;
-//                printf("[ mapping ]: time: IMU + Map + Input Downsample: %0.6f ave match: %0.6f ave solve: %0.6f  ave ICP: %0.6f  map incre: %0.6f ave total: %0.6f icp: %0.6f construct H: %0.6f \n",t1-t0,aver_time_match,aver_time_solve,t3-t1,t5-t3,aver_time_consu,aver_time_icp, aver_time_const_H_time);
+                printf("[ mapping ]: time: IMU + Map + Input Downsample: %0.6f ave match: %0.6f ave solve: %0.6f  ave ICP: %0.6f  map incre: %0.6f ave total: %0.6f icp: %0.6f construct H: %0.6f \n",t1-t0,aver_time_match,aver_time_solve,t3-t1,t5-t3,aver_time_consu,aver_time_icp, aver_time_const_H_time);
                 ext_euler = SO3ToEuler(state_point.offset_R_L_I);
                 fout_out << setw(20) << Measures.lidar_beg_time - first_lidar_time << " " << euler_cur.transpose() << " " << state_point.pos.transpose()<< " " << ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<<" "<< state_point.vel.transpose() \
                 <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<<" "<<feats_undistort->points.size()<<endl;
@@ -1524,11 +1584,9 @@ int main(int argc, char** argv)
                     if (scale_est_wheel)
                         cout << "wheel scale " << state_point.wheel_s << endl;
                 }
-                if (USE_GNSS)
+                if (USE_GNSS && extrinsic_leverarm_en)
                 {
-//                    ext_euler = SO3ToEuler(state_point.offset_R_G_I);
-//                    cout << setw(20) << "R_G_I " << ext_euler.transpose() << endl;
-                    GNSS_Heading = state_point.offset_R_G_I.toRotationMatrix();
+                    cout << setw(20) << "T_G_I " << state_point.offset_T_G_I.transpose() << endl;
                 }
                 dump_lio_state_to_log(fp);
             }

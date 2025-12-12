@@ -21,7 +21,7 @@ MTK_BUILD_MANIFOLD(state_ikfom,
 ((SO3, offset_R_W_I))
 ((vect3, offset_T_W_I))
 ((vect1, wheel_s))
-((SO3, offset_R_G_I))
+((vect3, offset_T_G_I))
 );
 
 MTK_BUILD_MANIFOLD(input_ikfom,

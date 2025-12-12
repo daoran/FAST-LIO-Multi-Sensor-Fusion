@@ -17,7 +17,7 @@ using namespace Eigen;
 #define USE_IKFOM
 
 #define PI_M (3.14159265358)
-#define G_m_s2 (9.8012)         // Gravaty const in Beijing/China
+#define G_m_s2 (9.80164)         // Gravaty const in Beijing/China
 #define DIM_STATE (18)        // Dimension of states (Let Dim(SO(3)) = 3)
 #define DIM_PROC_N (12)       // Dimension of process noise (Let Dim(SO(3)) = 3)
 #define CUBE_LEN  (6.0)
@@ -59,6 +59,7 @@ double wheel_cov = 0.01, nhc_y_cov = 0.01, nhc_z_cov = 0.01;
 
 bool USE_GNSS = false;
 bool opt_with_gnss = false;
+bool rebuild_ikdtree_flag = false;
 
 // 储存一帧lidar数据及imu数据序列
 struct MeasureGroup     // Lidar data and imu dates for the curent process

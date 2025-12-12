@@ -259,7 +259,7 @@ void ImuProcess::IMU_init(MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, in
   init_P(23,23) = init_P(24,24) = init_P(25,25) = 0.00001; // Wheel_R_wrt_IMU
   init_P(26,26) = init_P(27,27) = init_P(28,28) = 0.00001; // Wheel_T_wrt_IMU
   init_P(29,29) = 0.0001; // wheel scale
-  init_P(30,30) = init_P(31,31) = init_P(32,32) = 0.0001; // GNSS_Heading
+  init_P(30,30) = init_P(31,31) = init_P(32,32) = 0.0001; // GNSS_T_wrt_IMU
   kf_state.change_P(init_P);
   last_imu_ = meas.imu.back();
 
@@ -275,16 +275,29 @@ void ImuProcess::UndistortPcl(MeasureGroup &meas, esekfom::esekf<state_ikfom, 12
   const double &pcl_beg_time = meas.lidar_beg_time;
   const double &pcl_end_time = meas.lidar_end_time;
 
-  /*** downsample wheel meas, only remain meas in the middle ***/
-//  if (meas.wheel.size() > 1){
-//      int pop_num = meas.wheel.size() / 2;
-//      for (int i = 0; i < pop_num; i++){
-//          meas.wheel.pop_front();
-//      }
-//      auto wheel_meas = meas.wheel.front();
-//      meas.wheel.clear();
-//      meas.wheel.push_back(wheel_meas);
-//  }
+    /*** case when gnss meas is in the last lidar scan period but received in this period ***/
+    if (USE_GNSS && !meas.gnss.empty())
+    {
+        double gnss_time = meas.gnss.front()->header.stamp.toSec();
+        if (gnss_time < last_lidar_end_time_) // gnss is in the last period
+        {
+            opt_with_gnss = true;
+            if (!gnss_heading_need_init_)
+            {
+                if (meas.gnss.front()->pose.covariance[0] < 200) // 航向初始化未完成或gnss水平噪声大于200不进行更新（遮挡区域）
+                {
+                    kf_state.update_iterated_dyn_share(); // gnss更新
+                    cout << to_string(gnss_time) << " gnss update !" << endl;
+                }else{
+                    ROS_WARN("gnss too noise !");
+                }
+            }else{
+                ROS_WARN("gnss not initialized !");
+            }
+            opt_with_gnss = false;
+            meas.gnss.pop_front();
+        }
+    }
   
   /*** sort point clouds by offset time ***/
   pcl_out = *(meas.lidar);
@@ -355,7 +368,7 @@ void ImuProcess::UndistortPcl(MeasureGroup &meas, esekfom::esekf<state_ikfom, 12
                     if (meas.gnss.front()->pose.covariance[0] < 200) // 航向初始化未完成或gnss水平噪声大于200不进行更新（遮挡区域）
                     {
                         kf_state.update_iterated_dyn_share(); // gnss更新
-                        ROS_WARN("gnss update !");
+                        cout << to_string(gnss_time) << " gnss update !" << endl;
                     }else{
                         ROS_WARN("gnss too noise !");
                     }
@@ -490,9 +503,10 @@ void ImuProcess::Process(MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, in
               SO3 so3(GNSS_Heading);
               V3D euler = SO3ToEuler(so3);
               ROS_WARN_STREAM("INITIAL GNSS HEADING " << euler.transpose());
-              init_state.offset_R_G_I = GNSS_Heading;
+              init_state.rot = GNSS_Heading.transpose();
               kf_state.change_x(init_state);
               gnss_heading_need_init_ = false;
+              rebuild_ikdtree_flag = true;
           }
       }
   }
